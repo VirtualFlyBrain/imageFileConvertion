@@ -1,0 +1,20 @@
+# Core dependencies
+numpy>=1.20.0
+requests>=2.25.0
+
+# NRRD file handling
+pynrrd>=1.0.0
+
+# Neuroglancer precomputed format
+cloud-volume>=8.0.0
+
+# Mesh generation and processing
+scikit-image>=0.18.0
+scipy>=1.7.0
+trimesh>=3.10.0
+
+# SWC to mesh conversion
+navis>=1.0.0
+
+# OBJ file parsing (included with trimesh)
+# trimesh handles OBJ natively
