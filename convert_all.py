@@ -122,27 +122,26 @@ def process_image(vfb_id: str, template_id: str, category: str,
     elif category == "swc_to_mesh":
         from convert_swc_to_mesh import (
             download_file,
-            swc_to_mesh_navis,
-            swc_to_mesh_tubes,
-            write_precomputed_mesh,
+            swc_to_obj,
         )
+        from convert_obj_meshes import convert_obj_to_precomputed
+
+        # Step 1: Download SWC and generate OBJ (durable artifact)
         url = vfb_image_url(vfb_id, template_id, "volume.swc")
         with tempfile.NamedTemporaryFile(suffix=".swc", delete=False) as tmp:
             tmp_path = tmp.name
+        obj_path = os.path.join(output_dir, vfb_id + "_volume_man.obj")
         try:
             download_file(url, tmp_path)
-            try:
-                mesh = swc_to_mesh_navis(tmp_path, verbose=verbose)
-            except (ImportError, Exception):
-                if verbose:
-                    print("  navis failed, falling back to tube method")
-                mesh = swc_to_mesh_tubes(tmp_path, verbose=verbose)
-            write_precomputed_mesh(
-                mesh, output_dir, vfb_id,
-                resolution=resolution, verbose=verbose,
-            )
+            swc_to_obj(tmp_path, obj_path, verbose=verbose)
         finally:
             os.unlink(tmp_path)
+
+        # Step 2: Convert the OBJ to precomputed
+        convert_obj_to_precomputed(
+            obj_path, output_dir, vfb_id,
+            resolution=resolution, verbose=verbose,
+        )
 
     elif category == "nrrd":
         from convert_nrrd import convert_nrrd, download_file

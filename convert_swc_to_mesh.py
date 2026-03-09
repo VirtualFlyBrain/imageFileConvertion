@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-Category C: Convert SWC skeleton files to meshes, then to Neuroglancer
-precomputed mesh format.
+Category C: Convert SWC skeleton files to OBJ meshes (volume_man.obj).
 
 For neurons that have SWC tracings but no proper mesh (only a point-cloud OBJ),
-this script inflates the skeleton into a tubular mesh and writes it as
-precomputed format.
+this script inflates the skeleton into a tubular mesh and saves it as OBJ.
 
-Two approaches are provided:
+The generated OBJ can then be converted to Neuroglancer precomputed format
+using convert_obj_meshes.py (Category B), keeping a single reusable mesh
+artifact (volume_man.obj) for future use.
+
+Two mesh-generation approaches are provided:
   1. navis-based (preferred): Uses navis.conversion.tree2meshneuron() with CGAL
   2. trimesh-based (fallback): Manually creates truncated cones along each edge
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import tempfile
@@ -22,8 +23,6 @@ import tempfile
 import numpy as np
 import requests
 import trimesh
-from cloudvolume import CloudVolume
-from cloudvolume.mesh import Mesh
 
 
 def vfb_image_url(vfb_id: str, template_id: str, filename: str) -> str:
@@ -62,12 +61,16 @@ def parse_swc(filepath: str) -> dict:
             if len(parts) < 7:
                 continue
             node_id = int(parts[0])
+            try:
+                radius = float(parts[5])
+            except ValueError:
+                radius = float('nan')
             nodes[node_id] = {
                 "type": int(parts[1]),
                 "x": float(parts[2]),
                 "y": float(parts[3]),
                 "z": float(parts[4]),
-                "radius": float(parts[5]),
+                "radius": radius,
                 "parent": int(parts[6]),
             }
     return nodes
@@ -157,9 +160,13 @@ def create_tube_segment(p1: np.ndarray, p2: np.ndarray, r1: float, r2: float,
     return cylinder
 
 
-def swc_to_mesh_tubes(swc_path: str, tube_sides: int = 8,
-                      min_radius: float = 0.05, verbose: bool = True) -> trimesh.Trimesh:
-    """Convert SWC to mesh by creating tube segments along each edge."""
+def swc_to_mesh_tubes(swc_path: str, tube_sides: int = 20,
+                      min_radius: float = 0.2, verbose: bool = True) -> trimesh.Trimesh:
+    """Convert SWC to mesh by creating tube segments along each edge.
+
+    min_radius of 0.5 gives visible but not chunky tubes (Geppetto's
+    SWCReader.java uses 1.0, but that's too thick for precomputed meshes).
+    """
     nodes = parse_swc(swc_path)
 
     if verbose:
@@ -174,8 +181,10 @@ def swc_to_mesh_tubes(swc_path: str, tube_sides: int = 8,
         parent = nodes[parent_id]
         p1 = np.array([parent["x"], parent["y"], parent["z"]])
         p2 = np.array([node["x"], node["y"], node["z"]])
-        r1 = max(parent["radius"], min_radius)
-        r2 = max(node["radius"], min_radius)
+        r1 = parent["radius"] if not np.isnan(parent["radius"]) else min_radius
+        r1 = max(r1, min_radius)
+        r2 = node["radius"] if not np.isnan(node["radius"]) else min_radius
+        r2 = max(r2, min_radius)
 
         tube = create_tube_segment(p1, p2, r1, r2, n_sides=tube_sides)
         if tube is not None:
@@ -194,7 +203,8 @@ def swc_to_mesh_tubes(swc_path: str, tube_sides: int = 8,
 
     for nid in branch_points:
         node = nodes[nid]
-        r = max(node["radius"], min_radius)
+        r = node["radius"] if not np.isnan(node["radius"]) else min_radius
+        r = max(r, min_radius)
         sphere = trimesh.creation.icosphere(subdivisions=1, radius=r)
         sphere.apply_translation([node["x"], node["y"], node["z"]])
         meshes.append(sphere)
@@ -213,75 +223,34 @@ def swc_to_mesh_tubes(swc_path: str, tube_sides: int = 8,
     return combined
 
 
-# ---------------------------------------------------------------------------
-# Write precomputed
-# ---------------------------------------------------------------------------
+def swc_to_obj(swc_path: str, obj_path: str, method: str = "navis",
+               tube_sides: int = 20, verbose: bool = True) -> trimesh.Trimesh:
+    """Convert SWC to OBJ mesh file.
 
-def write_precomputed_mesh(mesh: trimesh.Trimesh, output_dir: str, vfb_id: str,
-                           resolution: list[float], segment_id: int = 1,
-                           label: str | None = None, verbose: bool = True):
-    """Write a trimesh to Neuroglancer precomputed mesh format."""
+    Returns the generated trimesh for inspection/further use.
+    """
+    if verbose:
+        print(f"Converting SWC: {swc_path}")
 
-    dest_local = os.path.join(output_dir, vfb_id)
-    os.makedirs(dest_local, exist_ok=True)
-    dest = f"file://{dest_local}"
+    if method == "navis":
+        try:
+            mesh = swc_to_mesh_navis(swc_path, verbose=verbose)
+        except ImportError:
+            if verbose:
+                print("  navis not available, falling back to tube method")
+            mesh = swc_to_mesh_tubes(swc_path, tube_sides=tube_sides,
+                                     verbose=verbose)
+    else:
+        mesh = swc_to_mesh_tubes(swc_path, tube_sides=tube_sides,
+                                 verbose=verbose)
 
-    # Compute size from mesh bounds
-    mesh_max = mesh.vertices.max(axis=0)
-    size = [int(np.ceil(mesh_max[i] / resolution[i])) + 2 for i in range(3)]
-
-    info = {
-        "data_type": "uint32",
-        "num_channels": 1,
-        "scales": [{
-            "chunk_sizes": [[64, 64, 64]],
-            "encoding": "raw",
-            "key": "0",
-            "resolution": resolution,
-            "size": size,
-            "voxel_offset": [0, 0, 0],
-        }],
-        "type": "segmentation",
-        "mesh": "mesh",
-        "segment_properties": "segment_properties",
-    }
-
-    vol = CloudVolume(dest, mip=0, info=info, compress=False)
-    vol.commit_info()
-
-    # Mesh directory
-    mesh_dir = os.path.join(dest_local, "mesh")
-    os.makedirs(mesh_dir, exist_ok=True)
-    with open(os.path.join(mesh_dir, "info"), "w") as f:
-        json.dump({"@type": "neuroglancer_legacy_mesh"}, f, indent=2)
-
-    # Write mesh
-    vertices = mesh.vertices.astype(np.float32)
-    faces = mesh.faces.astype(np.uint32)
-    mesh_obj = Mesh(vertices, faces, segid=segment_id)
-    vol.mesh.put(mesh_obj, compress=True)
-
-    # Segment properties
-    seg_dir = os.path.join(dest_local, "segment_properties")
-    os.makedirs(seg_dir, exist_ok=True)
-    display_label = label or vfb_id
-    seg_info = {
-        "@type": "neuroglancer_segment_properties",
-        "inline": {
-            "ids": [str(segment_id)],
-            "properties": [
-                {"id": "label", "type": "label", "values": [display_label]},
-                {"id": "description", "type": "description", "values": [vfb_id]},
-            ],
-        },
-    }
-    with open(os.path.join(seg_dir, "info"), "w") as f:
-        json.dump(seg_info, f, indent=2)
+    mesh.export(obj_path, file_type="obj")
 
     if verbose:
-        print(f"  Wrote precomputed mesh to {dest_local}")
+        print(f"  Saved OBJ: {obj_path} "
+              f"({len(mesh.vertices)} vertices, {len(mesh.faces)} faces)")
 
-    return dest_local
+    return mesh
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +259,7 @@ def write_precomputed_mesh(mesh: trimesh.Trimesh, output_dir: str, vfb_id: str,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert SWC skeleton files to Neuroglancer precomputed mesh format"
+        description="Convert SWC skeleton files to OBJ meshes (and optionally to precomputed format)"
     )
     parser.add_argument("--input-swc", default=None,
                         help="Path to local SWC file")
@@ -299,16 +268,18 @@ def main():
     parser.add_argument("--template-id", default="VFB_00101567",
                         help="Template ID for URL construction (default: JRC2018Unisex)")
     parser.add_argument("--output-dir", required=True,
-                        help="Output directory for precomputed datasets")
+                        help="Output directory (OBJ saved here as volume_man.obj)")
     parser.add_argument("--resolution", type=float, nargs=3,
                         default=[518.9161, 518.9161, 1000.0],
                         help="Voxel resolution in nm [x y z] (default: JRC2018U)")
     parser.add_argument("--method", choices=["navis", "tubes"], default="navis",
                         help="Mesh generation method (default: navis)")
-    parser.add_argument("--tube-sides", type=int, default=8,
-                        help="Number of sides per tube segment (tubes method only, default: 8)")
+    parser.add_argument("--tube-sides", type=int, default=20,
+                        help="Number of sides per tube segment (tubes method only, default: 20 to match Geppetto)")
     parser.add_argument("--label", default=None,
                         help="Display label for the mesh segment")
+    parser.add_argument("--precomputed", action="store_true",
+                        help="Also convert the OBJ to precomputed format")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -317,9 +288,9 @@ def main():
 
     output_dir = os.path.abspath(os.path.expanduser(args.output_dir))
     os.makedirs(output_dir, exist_ok=True)
+    vfb_id = args.vfb_id or os.path.splitext(os.path.basename(args.input_swc))[0]
 
     swc_path = args.input_swc
-    vfb_id = args.vfb_id or os.path.splitext(os.path.basename(args.input_swc))[0]
     tmp_swc = None
 
     if not swc_path:
@@ -331,30 +302,26 @@ def main():
         tmp_swc.close()
         download_file(url, swc_path)
 
+    # Step 1: SWC → OBJ (the durable artifact)
+    obj_path = os.path.join(output_dir, "volume_man.obj")
     try:
-        if args.verbose:
-            print(f"Converting SWC: {swc_path}")
-
-        if args.method == "navis":
-            try:
-                mesh = swc_to_mesh_navis(swc_path, verbose=args.verbose)
-            except ImportError:
-                print("  navis not available, falling back to tube method")
-                mesh = swc_to_mesh_tubes(swc_path, tube_sides=args.tube_sides,
-                                         verbose=args.verbose)
-        else:
-            mesh = swc_to_mesh_tubes(swc_path, tube_sides=args.tube_sides,
-                                     verbose=args.verbose)
-
-        write_precomputed_mesh(
-            mesh, output_dir, vfb_id,
-            resolution=args.resolution, label=args.label, verbose=args.verbose,
-        )
+        swc_to_obj(swc_path, obj_path, method=args.method,
+                   tube_sides=args.tube_sides, verbose=args.verbose)
     finally:
         if tmp_swc:
             os.unlink(swc_path)
 
-    print(f"Done. Output at: {output_dir}/{vfb_id}")
+    # Step 2 (optional): OBJ → precomputed (via convert_obj_meshes)
+    if args.precomputed:
+        from convert_obj_meshes import convert_obj_to_precomputed
+        convert_obj_to_precomputed(
+            obj_path, output_dir, vfb_id,
+            resolution=args.resolution, label=args.label, verbose=args.verbose,
+        )
+
+    print(f"Done. OBJ at: {obj_path}")
+    if args.precomputed:
+        print(f"Precomputed at: {output_dir}/{vfb_id}")
 
 
 if __name__ == "__main__":

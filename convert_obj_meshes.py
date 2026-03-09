@@ -118,7 +118,7 @@ def convert_obj_to_precomputed(obj_path: str, output_dir: str, vfb_id: str,
     faces = mesh.faces.astype(np.uint32)
 
     mesh_obj = Mesh(vertices, faces, segid=segment_id)
-    vol.mesh.put(mesh_obj, compress=True)
+    vol.mesh.put(mesh_obj, compress=False)
 
     # Create segment properties
     seg_dir = os.path.join(dest_local, "segment_properties")
