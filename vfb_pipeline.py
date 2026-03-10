@@ -7,9 +7,14 @@ Designed to run on the VFB Jenkins server where
 https://www.virtualflybrain.org/data/ is mounted at /IMAGE_WRITE/
 
 Workflow:
-  1. Scan /IMAGE_WRITE/VFB/i/ for image directories
+  1. Discover image directories (filesystem scan or KB query)
   2. For each image with volume.swc but no volume_man.obj → generate OBJ
   3. For each image with volume_man.obj but no neuroglancer/ → generate precomputed
+
+Discovery modes:
+  - Default: scan /IMAGE_WRITE/VFB/i/ filesystem
+  - --use-kb: query kb.virtualflybrain.org for live images from production
+    datasets only (requires vfb-connect package)
 
 Folder structure per image:
   /IMAGE_WRITE/VFB/i/{first4}/{last4}/{template_id}/
@@ -40,6 +45,9 @@ Usage:
   # Process specific IDs
   python vfb_pipeline.py --ids VFB_00000001 VFB_00000002
 
+  # Use KB to discover only live images from production datasets
+  python vfb_pipeline.py --use-kb
+
   # Process from a file
   python vfb_pipeline.py --ids-file missing_objs.txt
 
@@ -49,11 +57,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import logging
 import os
 import sys
 import time
+import types
 from pathlib import Path
 
 import numpy as np
@@ -71,7 +81,97 @@ VFB_DATA_DIR = os.path.join(IMAGE_ROOT, "VFB", "i")
 # Default resolution for JRC2018Unisex template (nm)
 DEFAULT_RESOLUTION = [518.9161, 518.9161, 1000.0]
 
+# KB (Knowledge Base) endpoint for VFBconnect
+KB_ENDPOINT = "http://kb.virtualflybrain.org"
+KB_USER = "neo4j"
+KB_PASSWORD = "vfb"
+
+# Folder URL prefix in KB → local path mapping
+KB_FOLDER_URL_PREFIX = "http://www.virtualflybrain.org/data/"
+
 log = logging.getLogger("vfb_pipeline")
+
+
+# ---------------------------------------------------------------------------
+# KB Discovery: query kb.virtualflybrain.org for live image directories
+# ---------------------------------------------------------------------------
+
+def _get_neo4j_connect():
+    """Import Neo4jConnect without triggering vfb_connect's slow __init__.
+
+    The vfb_connect package's __init__.py instantiates a global VfbConnect
+    object that connects to PDB and caches all terms, which blocks for a very
+    long time.  We bypass this by stubbing the top-level package and importing
+    the Neo4j module directly.
+    """
+    # If already imported (e.g. caller already set up the bypass), just use it
+    if "vfb_connect.neo.neo4j_tools" in sys.modules:
+        mod = sys.modules["vfb_connect.neo.neo4j_tools"]
+        return mod.Neo4jConnect, mod.dict_cursor
+
+    # Remove any existing stub so find_spec works on the real package
+    saved = sys.modules.pop("vfb_connect", None)
+    try:
+        spec = importlib.util.find_spec("vfb_connect")
+    finally:
+        # Restore or re-stub immediately
+        if saved is not None:
+            sys.modules["vfb_connect"] = saved
+
+    if spec is None or spec.submodule_search_locations is None:
+        raise ImportError("vfb_connect is not installed — pip install vfb-connect")
+
+    pkg = types.ModuleType("vfb_connect")
+    pkg.__path__ = list(spec.submodule_search_locations)
+    sys.modules["vfb_connect"] = pkg
+    from vfb_connect.neo.neo4j_tools import Neo4jConnect, dict_cursor  # noqa: E402
+    return Neo4jConnect, dict_cursor
+
+
+def iter_kb_image_dirs(image_root: str = IMAGE_ROOT):
+    """Query KB for live image folders from production datasets.
+
+    Yields (image_dir, vfb_id, template_id) tuples, matching the
+    interface of iter_image_dirs().
+    """
+    Neo4jConnect, dict_cursor = _get_neo4j_connect()
+    nc = Neo4jConnect(endpoint=KB_ENDPOINT, usr=KB_USER, pwd=KB_PASSWORD)
+
+    query = """
+        MATCH (c:Individual)-[:depicts]->(i:Individual)-[:has_source]->(ds:DataSet)
+        MATCH (c)-[r:in_register_with]->(t:Template)
+        WHERE ds.production[0] = true
+          AND r.folder IS NOT NULL
+          AND (r.block IS NULL OR NOT r.block[0] = 'Missing Image')
+        RETURN DISTINCT i.short_form AS id, r.folder[0] AS folder
+    """
+
+    log.info("Querying KB at %s for live image directories...", KB_ENDPOINT)
+    results = nc.commit_list([query])
+    rows = dict_cursor(results)
+
+    count = 0
+    for row in rows:
+        folder_url = row["folder"]
+        vfb_id = row["id"]
+
+        # Map URL to local path: replace URL prefix with IMAGE_ROOT
+        if not folder_url.startswith(KB_FOLDER_URL_PREFIX):
+            log.debug("  Skipping unexpected folder URL: %s", folder_url)
+            continue
+
+        rel_path = folder_url[len(KB_FOLDER_URL_PREFIX):]
+        # Strip trailing slash
+        rel_path = rel_path.rstrip("/")
+        image_dir = os.path.join(image_root, rel_path)
+
+        # Template ID is the last component of the path
+        template_id = os.path.basename(image_dir)
+
+        count += 1
+        yield image_dir, vfb_id, template_id
+
+    log.info("KB returned %d live image directories", count)
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +522,8 @@ def main():
 
     parser.add_argument("--image-root", default=IMAGE_ROOT,
                         help="Root of VFB image data (default: /IMAGE_WRITE)")
+    parser.add_argument("--use-kb", action="store_true",
+                        help="Query kb.virtualflybrain.org for live images instead of scanning the filesystem")
     parser.add_argument("--resolution", type=float, nargs=3,
                         default=DEFAULT_RESOLUTION,
                         help="Voxel resolution in nm [x y z]")
@@ -467,6 +569,10 @@ def main():
                 for d in find_image_dir(vfb_id, vfb_data_dir):
                     template_id = os.path.basename(d)
                     targets.append((d, vfb_id, template_id))
+    elif args.use_kb:
+        log.info("Using KB to discover live image directories...")
+        targets = list(iter_kb_image_dirs(args.image_root))
+        log.info("Found %d live image directories from KB", len(targets))
     else:
         # Scan all
         log.info("Scanning %s for image directories...", vfb_data_dir)

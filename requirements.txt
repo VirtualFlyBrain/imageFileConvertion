@@ -13,6 +13,9 @@ scikit-image>=0.18.0
 scipy>=1.7.0
 trimesh>=3.10.0
 
+# VFB Knowledge Base connectivity (optional, for --use-kb mode)
+vfb-connect>=2.0.0
+
 # SWC to mesh conversion
 navis>=1.0.0
 
