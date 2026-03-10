@@ -469,9 +469,12 @@ def process_image(image_dir: str, vfb_id: str, template_id: str,
         log.debug("  [%s] Already complete, skipping", vfb_id)
         return result
 
-    log.info("[%s] %s (swc=%s, obj=%s, ng=%s)",
+    obj_status = ("mesh" if status["has_obj_man_faces"]
+                  else "no-faces" if status["has_obj_man"]
+                  else "missing")
+    log.info("[%s] %s (swc=%s, obj_man=%s, ng=%s)",
              vfb_id, image_dir,
-             status["has_swc"], status["has_obj_man"],
+             status["has_swc"], obj_status,
              status["has_neuroglancer"])
 
     if dry_run:
