@@ -71,6 +71,12 @@ import trimesh
 from cloudvolume import CloudVolume
 from cloudvolume.mesh import Mesh
 
+# Import NRRD converter (same package)
+try:
+    from convert_nrrd import convert_nrrd as _convert_nrrd
+except ImportError:
+    _convert_nrrd = None
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -223,6 +229,7 @@ def classify_dir(image_dir: str) -> dict:
     d = Path(image_dir)
     return {
         "has_swc": (d / "volume.swc").is_file(),
+        "has_nrrd": (d / "volume.nrrd").is_file(),
         "has_obj_man": (d / "volume_man.obj").is_file(),
         "has_obj_man_faces": (
             has_faces(str(d / "volume_man.obj"))
@@ -472,9 +479,9 @@ def process_image(image_dir: str, vfb_id: str, template_id: str,
     obj_status = ("mesh" if status["has_obj_man_faces"]
                   else "no-faces" if status["has_obj_man"]
                   else "missing")
-    log.info("[%s] %s (swc=%s, obj_man=%s, ng=%s)",
+    log.info("[%s] %s (swc=%s, nrrd=%s, obj_man=%s, ng=%s)",
              vfb_id, image_dir,
-             status["has_swc"], obj_status,
+             status["has_swc"], status["has_nrrd"], obj_status,
              status["has_neuroglancer"])
 
     if dry_run:
@@ -482,6 +489,8 @@ def process_image(image_dir: str, vfb_id: str, template_id: str,
             log.info("  Would generate: volume_man.obj from volume.swc")
         if needs_precomputed and (has_usable_obj or needs_obj):
             log.info("  Would generate: neuroglancer/ from volume_man.obj")
+        if needs_precomputed and status["has_nrrd"] and not has_usable_obj and not needs_obj:
+            log.info("  Would generate: neuroglancer/ (including 0/ chunks) from volume.nrrd")
         return result
 
     # Step 1: Generate OBJ from SWC if needed
@@ -495,7 +504,7 @@ def process_image(image_dir: str, vfb_id: str, template_id: str,
             log.error("  ERROR generating OBJ: %s", e)
             return result
 
-    # Step 2: Generate precomputed from OBJ if needed
+    # Step 2a: Generate precomputed from OBJ if available
     if needs_precomputed and has_usable_obj:
         try:
             obj_path = os.path.join(image_dir, "volume_man.obj")
@@ -505,6 +514,29 @@ def process_image(image_dir: str, vfb_id: str, template_id: str,
         except Exception as e:
             result["error"] = f"Precomputed generation failed: {e}"
             log.error("  ERROR generating precomputed: %s", e)
+
+    # Step 2b: Generate precomputed (with 0/ volume chunks) from NRRD when no OBJ is available
+    elif needs_precomputed and status["has_nrrd"]:
+        if _convert_nrrd is None:
+            result["error"] = "convert_nrrd module not available"
+            log.error("  ERROR: convert_nrrd module could not be imported")
+        else:
+            try:
+                nrrd_path = os.path.join(image_dir, "volume.nrrd")
+                log.info("  Generating neuroglancer/ (with 0/ chunks) from NRRD: %s", nrrd_path)
+                # convert_nrrd writes to {output_dir}/{dataset_name}/, so passing
+                # image_dir + "neuroglancer" produces image_dir/neuroglancer/ with
+                # the 0/ chunk directory, mesh/, segment_properties/ all inside it.
+                _convert_nrrd(
+                    nrrd_path=nrrd_path,
+                    output_dir=image_dir,
+                    dataset_name="neuroglancer",
+                    verbose=log.isEnabledFor(logging.DEBUG),
+                )
+                result["precomputed_generated"] = True
+            except Exception as e:
+                result["error"] = f"NRRD precomputed generation failed: {e}"
+                log.error("  ERROR generating precomputed from NRRD: %s", e)
 
     return result
 
