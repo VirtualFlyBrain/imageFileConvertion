@@ -149,6 +149,7 @@ def iter_kb_image_dirs(image_root: str = IMAGE_ROOT):
         WHERE ds.production[0] = true
           AND r.folder IS NOT NULL
           AND (r.block IS NULL OR NOT r.block[0] = 'Missing Image')
+          AND NOT t.short_form = 'VFBc_00017894'
         RETURN DISTINCT i.short_form AS id, r.folder[0] AS folder
     """
 
