@@ -161,91 +161,123 @@ def convert_nrrd(nrrd_path: str, output_dir: str, dataset_name: str,
 
     # Generate mesh from the external boundary of all non-zero voxels
     if is_segmentation:
-        _generate_external_mesh(arr, dest_local, vol, voxel_size, dust_threshold, verbose)
+        _generate_external_mesh(arr, dest_local, vol, voxel_size, voxel_offset, dust_threshold, compress, verbose)
 
     return dest_local
 
 
-def _generate_external_mesh(arr, dest_local, vol, voxel_size, dust_threshold, verbose):
-    """Generate a single mesh from the outer boundary of all non-zero voxels."""
+def _setup_mesh_metadata(dest_local, vol, verbose):
+    """Ensure mesh metadata is properly configured (matches meshes_generator.py)."""
+    needs_update = False
+    if "mesh" not in vol.info or vol.info["mesh"] is None:
+        vol.info["mesh"] = "mesh"
+        needs_update = True
+    if "segment_properties" not in vol.info or vol.info["segment_properties"] is None:
+        vol.info["segment_properties"] = "segment_properties"
+        needs_update = True
+    if needs_update:
+        vol.commit_info()
 
-    # Setup mesh directory
     mesh_dir = os.path.join(dest_local, "mesh")
     os.makedirs(mesh_dir, exist_ok=True)
+
+    mesh_info = {
+        "@type": "neuroglancer_legacy_mesh",
+        "mip": 0,
+        "vertex_quantization_bits": 10,
+        "lod_scale_multiplier": 1.0,
+    }
     with open(os.path.join(mesh_dir, "info"), "w") as f:
-        json.dump({"@type": "neuroglancer_legacy_mesh"}, f, indent=2)
+        json.dump(mesh_info, f, indent=2)
 
-    # All non-zero segment IDs
-    all_segments = np.unique(arr)
-    all_segments = all_segments[all_segments > 0]
+    if verbose:
+        print("  Mesh metadata configured (legacy format)")
 
-    if len(all_segments) == 0:
+
+def _generate_external_mesh(arr, dest_local, vol, voxel_size, voxel_offset, dust_threshold, compress, verbose):
+    """Generate a single mesh from the outer boundary of all non-zero voxels.
+
+    Uses the same approach as meshes_generator.py with merge_segments=True:
+    a single mesh with segment ID 1, vertices transformed to physical coordinates
+    including voxel_offset.
+    """
+
+    _setup_mesh_metadata(dest_local, vol, verbose)
+
+    # Create binary mask of all non-zero voxels
+    mask = arr > 0
+    voxel_count = int(np.sum(mask))
+
+    if voxel_count == 0:
         if verbose:
-            print("  No non-zero segments found, skipping mesh generation")
-        _write_segment_properties(dest_local, [], [])
+            print("  No non-zero voxels found, skipping mesh generation")
+        _write_segment_properties(dest_local, [], [], [])
         return
-
-    # Create binary mask of all non-zero voxels for a single external mesh
-    binary_mask = (arr > 0).astype(np.float32)
-    voxel_count = int(np.sum(binary_mask > 0))
 
     if voxel_count < dust_threshold:
         if verbose:
             print(f"  Skipping mesh: only {voxel_count} non-zero voxels (< {dust_threshold})")
-        _write_segment_properties(dest_local, [], [])
+        _write_segment_properties(dest_local, [], [], [])
         return
 
     if verbose:
-        print(f"  Generating external boundary mesh from {voxel_count} non-zero voxels "
-              f"({len(all_segments)} segment(s))")
+        print(f"  Creating merged mesh from {voxel_count} voxels...")
 
     try:
-        vertices, faces, _, _ = measure.marching_cubes(binary_mask, level=0.5, allow_degenerate=False)
+        vertices, faces, _, _ = measure.marching_cubes(mask, level=0.5, allow_degenerate=False)
     except (ValueError, RuntimeError) as e:
         if verbose:
-            print(f"  Mesh generation failed: {e}")
-        _write_segment_properties(dest_local, [], [])
+            print(f"  Failed to generate merged mesh: {e}")
+        _write_segment_properties(dest_local, [], [], [])
         return
 
     if len(vertices) == 0 or len(faces) == 0:
         if verbose:
-            print("  No mesh geometry produced")
-        _write_segment_properties(dest_local, [], [])
+            print("  Merged mesh has no geometry")
+        _write_segment_properties(dest_local, [], [], [])
         return
 
-    # Scale vertices by voxel resolution
+    # Transform vertices to physical coordinates (resolution + offset)
     vertices = vertices.astype(np.float32)
-    vertices[:, 0] *= voxel_size[0]
-    vertices[:, 1] *= voxel_size[1]
-    vertices[:, 2] *= voxel_size[2]
+    vertices[:, 0] = vertices[:, 0] * voxel_size[0] + voxel_offset[0]
+    vertices[:, 1] = vertices[:, 1] * voxel_size[1] + voxel_offset[1]
+    vertices[:, 2] = vertices[:, 2] * voxel_size[2] + voxel_offset[2]
+    faces = faces.astype(np.uint32)
 
     if verbose:
-        print(f"    External mesh: {len(vertices)} vertices, {len(faces)} faces")
+        print(f"  Merged mesh: {len(vertices)} vertices, {len(faces)} faces")
 
-    # Write the same external mesh for every segment ID so it is visible
-    # regardless of which segment is selected in Neuroglancer
-    for seg_id in all_segments:
-        mesh_obj = Mesh(vertices, faces.astype(np.uint32), segid=int(seg_id))
-        vol.mesh.put(mesh_obj, compress=True)
+    # Use the lowest non-zero segment ID present in the volume for the mesh,
+    # so it is visible when intensity filtering removes low segment IDs.
+    all_segments = np.unique(arr)
+    all_segments = all_segments[all_segments > 0]
+    mesh_seg_id = int(all_segments[0])
 
-    seg_ids = [str(s) for s in all_segments]
-    seg_labels = [f"Segment {s}" for s in all_segments]
-    _write_segment_properties(dest_local, seg_ids, seg_labels)
+    mesh_obj = Mesh(vertices, faces, segid=mesh_seg_id)
+    vol.mesh.put(mesh_obj, compress=compress)
+
+    _write_segment_properties(
+        dest_local, [mesh_seg_id],
+        [f"Segment {mesh_seg_id}"],
+        ["Merged external boundary"],
+    )
 
     if verbose:
-        print(f"  Wrote external mesh for {len(all_segments)} segment(s)")
+        print(f"  Wrote merged external boundary mesh (segment ID {mesh_seg_id})")
 
 
-def _write_segment_properties(dest_local, seg_ids, seg_labels):
+def _write_segment_properties(dest_local, seg_ids, seg_labels, seg_descriptions):
     """Write segment_properties/info for Neuroglancer."""
     seg_dir = os.path.join(dest_local, "segment_properties")
     os.makedirs(seg_dir, exist_ok=True)
+    ids = [str(s) for s in seg_ids]
     seg_info = {
         "@type": "neuroglancer_segment_properties",
         "inline": {
-            "ids": seg_ids,
+            "ids": ids,
             "properties": [
                 {"id": "label", "type": "label", "values": seg_labels},
+                {"id": "description", "type": "description", "values": seg_descriptions},
             ],
         },
     }
