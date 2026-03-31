@@ -198,9 +198,8 @@ def _has_volume_files(directory: Path) -> bool:
 def iter_image_dirs(vfb_data_dir: str = VFB_DATA_DIR):
     """Yield (image_dir, vfb_id, template_id) for every image directory under VFB/i/.
 
-    Supports two directory layouts:
-      - 3-level: VFB/i/{first4}/{last4}/{template_id}/volume.nrrd
-      - 2-level: VFB/i/{first4}/{last4}/volume.nrrd  (no template sub-dir)
+    Directory layout: VFB/i/{first4}/{last4}/{template_id}/volume.nrrd
+    Only yields template directories that contain recognised volume files.
     """
     vfb_data = Path(vfb_data_dir)
     if not vfb_data.is_dir():
@@ -213,36 +212,26 @@ def iter_image_dirs(vfb_data_dir: str = VFB_DATA_DIR):
         for last4 in sorted(first4.iterdir()):
             if not last4.is_dir():
                 continue
-            vfb_id = "VFB_" + first4.name + last4.name
-
-            # 2-level: volume files sit directly in {last4}/
-            if _has_volume_files(last4):
-                yield str(last4), vfb_id, ""
-
-            # 3-level: each subdirectory is a template alignment
+            # Each subdirectory under last4/ is a template alignment
             for template_dir in sorted(last4.iterdir()):
                 if not template_dir.is_dir():
                     continue
                 if _has_volume_files(template_dir):
+                    vfb_id = "VFB_" + first4.name + last4.name
                     yield str(template_dir), vfb_id, template_dir.name
 
 
 def find_image_dir(vfb_id: str, vfb_data_dir: str = VFB_DATA_DIR) -> list[str]:
     """Find all image directories for a given VFB ID (may be aligned to multiple templates).
 
-    Returns the parent directory itself when volume files live directly in it
-    (2-level layout) as well as any template sub-directories (3-level layout).
+    Only returns template sub-directories that contain recognised volume files.
     """
     prefix = vfb_id.replace("VFB_", "")
     first4, last4 = prefix[:4], prefix[4:]
     parent = Path(vfb_data_dir) / first4 / last4
     if not parent.is_dir():
         return []
-    dirs = []
-    if _has_volume_files(parent):
-        dirs.append(str(parent))
-    dirs.extend(str(d) for d in sorted(parent.iterdir()) if d.is_dir() and _has_volume_files(d))
-    return dirs
+    return [str(d) for d in sorted(parent.iterdir()) if d.is_dir() and _has_volume_files(d)]
 
 
 def has_faces(obj_path: str) -> bool:
