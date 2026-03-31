@@ -61,6 +61,7 @@ import importlib.util
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 import types
@@ -185,8 +186,21 @@ def iter_kb_image_dirs(image_root: str = IMAGE_ROOT):
 # Discovery: find image directories and classify them
 # ---------------------------------------------------------------------------
 
+# Volume files that indicate an image directory
+_VOLUME_FILES = {"volume.nrrd", "volume.swc", "volume.wlz", "volume.obj"}
+
+
+def _has_volume_files(directory: Path) -> bool:
+    """Return True if the directory contains any recognised volume file."""
+    return any((directory / f).is_file() for f in _VOLUME_FILES)
+
+
 def iter_image_dirs(vfb_data_dir: str = VFB_DATA_DIR):
-    """Yield (image_dir, vfb_id) for every image directory under VFB/i/."""
+    """Yield (image_dir, vfb_id, template_id) for every image directory under VFB/i/.
+
+    Directory layout: VFB/i/{first4}/{last4}/{template_id}/volume.nrrd
+    Only yields template directories that contain recognised volume files.
+    """
     vfb_data = Path(vfb_data_dir)
     if not vfb_data.is_dir():
         log.error("VFB data directory not found: %s", vfb_data)
@@ -202,18 +216,22 @@ def iter_image_dirs(vfb_data_dir: str = VFB_DATA_DIR):
             for template_dir in sorted(last4.iterdir()):
                 if not template_dir.is_dir():
                     continue
-                vfb_id = "VFB_" + first4.name + last4.name
-                yield str(template_dir), vfb_id, template_dir.name
+                if _has_volume_files(template_dir):
+                    vfb_id = "VFB_" + first4.name + last4.name
+                    yield str(template_dir), vfb_id, template_dir.name
 
 
 def find_image_dir(vfb_id: str, vfb_data_dir: str = VFB_DATA_DIR) -> list[str]:
-    """Find all image directories for a given VFB ID (may be aligned to multiple templates)."""
+    """Find all image directories for a given VFB ID (may be aligned to multiple templates).
+
+    Only returns template sub-directories that contain recognised volume files.
+    """
     prefix = vfb_id.replace("VFB_", "")
     first4, last4 = prefix[:4], prefix[4:]
     parent = Path(vfb_data_dir) / first4 / last4
     if not parent.is_dir():
         return []
-    return [str(d) for d in sorted(parent.iterdir()) if d.is_dir()]
+    return [str(d) for d in sorted(parent.iterdir()) if d.is_dir() and _has_volume_files(d)]
 
 
 def has_faces(obj_path: str) -> bool:
@@ -447,9 +465,22 @@ def write_precomputed(obj_path: str, output_dir: str,
 # ---------------------------------------------------------------------------
 
 def process_image(image_dir: str, vfb_id: str, template_id: str,
-                  force: bool = False, dry_run: bool = False,
+                  force: bool = False, overwrite: bool = False,
+                  dry_run: bool = False,
+                  merge_segments: bool = False,
+                  min_intensity: int | None = None,
+                  max_intensity: int | None = None,
                   resolution: list[float] = DEFAULT_RESOLUTION) -> dict:
     """Process a single image directory. Returns a status dict."""
+
+    # --overwrite: remove existing neuroglancer/ so it will be regenerated
+    ng_dir = os.path.join(image_dir, "neuroglancer")
+    if overwrite and os.path.isdir(ng_dir):
+        if dry_run:
+            log.info("  [%s] Would delete existing neuroglancer/ for overwrite", vfb_id)
+        else:
+            log.info("  [%s] Deleting existing neuroglancer/ (--overwrite)", vfb_id)
+            shutil.rmtree(ng_dir)
 
     status = classify_dir(image_dir)
     result = {
@@ -532,6 +563,9 @@ def process_image(image_dir: str, vfb_id: str, template_id: str,
                     nrrd_path=nrrd_path,
                     output_dir=image_dir,
                     dataset_name="neuroglancer",
+                    merge_segments=merge_segments,
+                    min_intensity=min_intensity,
+                    max_intensity=max_intensity,
                     verbose=log.isEnabledFor(logging.DEBUG),
                 )
                 result["precomputed_generated"] = True
@@ -565,6 +599,14 @@ def main():
                         help="Voxel resolution in nm [x y z]")
     parser.add_argument("--force", action="store_true",
                         help="Regenerate even if output already exists")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Delete existing neuroglancer/ folder and regenerate from scratch")
+    parser.add_argument("--merge-segments", action="store_true",
+                        help="Merge all non-zero voxels into a single segment for NRRD conversion")
+    parser.add_argument("--min-intensity", type=int, default=None,
+                        help="Minimum segment ID/intensity to keep (values below will be set to 0)")
+    parser.add_argument("--max-intensity", type=int, default=None,
+                        help="Maximum segment ID/intensity to keep (values above will be set to 0)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be done without making changes")
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -635,7 +677,11 @@ def main():
 
         result = process_image(
             image_dir, vfb_id, template_id,
-            force=args.force, dry_run=args.dry_run,
+            force=args.force, overwrite=args.overwrite,
+            dry_run=args.dry_run,
+            merge_segments=args.merge_segments,
+            min_intensity=args.min_intensity,
+            max_intensity=args.max_intensity,
             resolution=args.resolution,
         )
 

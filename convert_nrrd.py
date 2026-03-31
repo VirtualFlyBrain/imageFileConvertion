@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Category D: Convert NRRD volume files to Neuroglancer precomputed format
-with meshes generated via marching cubes.
+Convert NRRD volume files to Neuroglancer precomputed format
+with a mesh generated from the external volume boundary.
 
-For images that only have volumetric NRRD data (expression patterns,
-individual painted domain volumes, confocal images), this script:
+This script:
   1. Reads the NRRD file
-  2. Converts to precomputed segmentation format
-  3. Generates meshes via marching cubes on thresholded/labeled regions
-  4. Removes dust (small disconnected components)
+  2. Converts to precomputed format (segmentation or image layer)
+  3. For segmentation data, generates a single mesh from the outer boundary
+     of all non-zero voxels via marching cubes
 
-Based on the approach from MetaCell/virtual-fly-brain PR #207.
+Volume conversion approach matches MetaCell/virtual-fly-brain converter.py:
+  - Detects voxel spacing and origin from NRRD header
+  - Writes data as-is (no thresholding/relabeling for integer data)
+  - Supports gzip compression
 """
 from __future__ import annotations
 
@@ -24,7 +26,6 @@ import numpy as np
 import nrrd
 import requests
 from cloudvolume import CloudVolume
-from cloudvolume.lib import Bbox
 from cloudvolume.mesh import Mesh
 
 try:
@@ -53,7 +54,7 @@ def detect_spacing(header: dict) -> list[float]:
     if "space directions" in header and header["space directions"] is not None:
         try:
             dirs = header["space directions"]
-            return [abs(float(np.linalg.norm(d))) if d is not None else 1.0 for d in dirs][::-1]
+            return [float(np.linalg.norm(d)) if d is not None else 1.0 for d in dirs][::-1]
         except Exception:
             pass
     if "spacings" in header:
@@ -64,10 +65,30 @@ def detect_spacing(header: dict) -> list[float]:
     return [1.0, 1.0, 1.0]
 
 
+def detect_origin(header: dict) -> list[float]:
+    """Extract space origin from NRRD header and convert to XYZ order."""
+    if "space origin" in header and header["space origin"] is not None:
+        try:
+            origin = header["space origin"]
+            return [float(x) for x in origin[::-1]]
+        except Exception:
+            pass
+    return [0.0, 0.0, 0.0]
+
+
 def convert_nrrd(nrrd_path: str, output_dir: str, dataset_name: str,
                  threshold: float | None = None, dust_threshold: int = 100,
-                 merge_segments: bool = False, verbose: bool = True):
-    """Convert an NRRD volume to precomputed format with mesh generation."""
+                 merge_segments: bool = False,
+                 min_intensity: int | None = None,
+                 max_intensity: int | None = None,
+                 compress: bool = False,
+                 verbose: bool = True):
+    """Convert an NRRD volume to precomputed format with external-boundary mesh.
+
+    The volume is written as-is (matching converter.py behaviour).
+    A single mesh is generated from the outer boundary of all non-zero voxels
+    rather than one mesh per segmented region.
+    """
 
     if verbose:
         print(f"Reading NRRD: {nrrd_path}")
@@ -79,43 +100,31 @@ def convert_nrrd(nrrd_path: str, output_dir: str, dataset_name: str,
     # Transpose from ZYX (NRRD) to XYZ (Neuroglancer)
     arr = np.transpose(data, (2, 1, 0)).copy()
     voxel_size = detect_spacing(header)
+    voxel_offset = detect_origin(header)
 
     if verbose:
         print(f"  Shape (XYZ): {arr.shape}")
         print(f"  Voxel size:  {voxel_size}")
+        print(f"  Voxel offset: {voxel_offset}")
         print(f"  Dtype:       {arr.dtype}")
         print(f"  Value range: [{arr.min()}, {arr.max()}]")
 
-    # For floating-point data (confocal images), threshold to create a binary mask
-    # then label connected components
-    is_segmentation = np.issubdtype(arr.dtype, np.integer) and not merge_segments
-
-    if not is_segmentation:
-        if threshold is None:
-            # Auto-threshold at mean + 1 std for intensity data
-            nonzero = arr[arr > 0]
-            if len(nonzero) > 0:
-                threshold = float(np.mean(nonzero))
-            else:
-                threshold = 0.5
-
-        if verbose:
-            print(f"  Thresholding at {threshold}")
-
-        binary = arr > threshold
-
-        if merge_segments:
-            # Create a single segment from all non-zero voxels
-            arr = binary.astype(np.uint32)
-        else:
-            from scipy import ndimage
-            labeled, num_features = ndimage.label(binary)
-            arr = labeled.astype(np.uint32)
+    # Apply intensity filtering if specified (for segmentation data)
+    if np.issubdtype(arr.dtype, np.integer):
+        if min_intensity is not None or max_intensity is not None:
+            original_segments = len(np.unique(arr[arr > 0]))
+            if min_intensity is not None:
+                arr[arr < min_intensity] = 0
+            if max_intensity is not None:
+                arr[arr > max_intensity] = 0
+            filtered_segments = len(np.unique(arr[arr > 0]))
             if verbose:
-                print(f"  Found {num_features} connected components")
-    else:
-        arr = arr.astype(np.uint32) if arr.dtype != np.uint32 else arr
+                print(f"  Intensity filter: {original_segments} segments -> {filtered_segments} segments")
+                print(f"  Range: [{min_intensity or 'any'}, {max_intensity or 'any'}]")
 
+    # Determine layer type
+    is_segmentation = np.issubdtype(arr.dtype, np.integer)
+    layer_type = "segmentation" if is_segmentation else "image"
     dtype_str = str(np.dtype(arr.dtype).name)
 
     dest_local = os.path.join(output_dir, dataset_name)
@@ -132,86 +141,148 @@ def convert_nrrd(nrrd_path: str, output_dir: str, dataset_name: str,
             "key": "0",
             "resolution": voxel_size,
             "size": list(arr.shape),
-            "voxel_offset": [0, 0, 0],
+            "voxel_offset": voxel_offset,
         }],
-        "type": "segmentation",
-        "mesh": "mesh",
-        "segment_properties": "segment_properties",
+        "type": layer_type,
     }
 
-    vol = CloudVolume(dest, mip=0, info=info, compress=False)
+    if is_segmentation:
+        info["mesh"] = "mesh"
+        info["segment_properties"] = "segment_properties"
+
+    vol = CloudVolume(dest, mip=0, info=info, compress=compress)
     vol.commit_info()
     vol[:, :, :] = arr
 
     if verbose:
         print(f"  Wrote precomputed volume to {dest_local}")
+        print(f"  Layer type: {layer_type}")
+        print(f"  Compression: {'gzip' if compress else 'none'}")
 
-    # Setup mesh
+    # Generate mesh from the external boundary of all non-zero voxels
+    if is_segmentation:
+        _generate_external_mesh(arr, dest_local, vol, voxel_size, voxel_offset, dust_threshold, compress, verbose)
+
+    return dest_local
+
+
+def _setup_mesh_metadata(dest_local, vol, verbose):
+    """Ensure mesh metadata is properly configured (matches meshes_generator.py)."""
+    needs_update = False
+    if "mesh" not in vol.info or vol.info["mesh"] is None:
+        vol.info["mesh"] = "mesh"
+        needs_update = True
+    if "segment_properties" not in vol.info or vol.info["segment_properties"] is None:
+        vol.info["segment_properties"] = "segment_properties"
+        needs_update = True
+    if needs_update:
+        vol.commit_info()
+
     mesh_dir = os.path.join(dest_local, "mesh")
     os.makedirs(mesh_dir, exist_ok=True)
-    with open(os.path.join(mesh_dir, "info"), "w") as f:
-        json.dump({"@type": "neuroglancer_legacy_mesh"}, f, indent=2)
 
-    # Find segments and generate meshes
-    all_segments = np.unique(arr)
-    all_segments = all_segments[all_segments > 0]
+    mesh_info = {
+        "@type": "neuroglancer_legacy_mesh",
+        "mip": 0,
+        "vertex_quantization_bits": 10,
+        "lod_scale_multiplier": 1.0,
+    }
+    with open(os.path.join(mesh_dir, "info"), "w") as f:
+        json.dump(mesh_info, f, indent=2)
 
     if verbose:
-        print(f"  Found {len(all_segments)} non-zero segments")
+        print("  Mesh metadata configured (legacy format)")
 
-    resolution = voxel_size
-    seg_ids = []
-    seg_labels = []
 
-    generated = 0
-    for seg_id in all_segments:
-        mask = arr == seg_id
-        voxel_count = int(np.sum(mask))
-        if voxel_count < dust_threshold:
-            continue
+def _generate_external_mesh(arr, dest_local, vol, voxel_size, voxel_offset, dust_threshold, compress, verbose):
+    """Generate a single mesh from the outer boundary of all non-zero voxels.
 
-        try:
-            vertices, faces, _, _ = measure.marching_cubes(mask, level=0.5, allow_degenerate=False)
-        except (ValueError, RuntimeError):
-            continue
+    Uses the same approach as meshes_generator.py with merge_segments=True:
+    a single mesh with segment ID 1, vertices transformed to physical coordinates
+    including voxel_offset.
+    """
 
-        if len(vertices) == 0 or len(faces) == 0:
-            continue
+    _setup_mesh_metadata(dest_local, vol, verbose)
 
-        vertices = vertices.astype(np.float32)
-        vertices[:, 0] *= resolution[0]
-        vertices[:, 1] *= resolution[1]
-        vertices[:, 2] *= resolution[2]
+    # Create binary mask of all non-zero voxels
+    mask = arr > 0
+    voxel_count = int(np.sum(mask))
 
-        mesh_obj = Mesh(vertices, faces.astype(np.uint32), segid=int(seg_id))
-        vol.mesh.put(mesh_obj, compress=True)
+    if voxel_count == 0:
+        if verbose:
+            print("  No non-zero voxels found, skipping mesh generation")
+        _write_segment_properties(dest_local, [], [], [])
+        return
 
-        seg_ids.append(str(seg_id))
-        seg_labels.append(f"Segment {seg_id} ({voxel_count} voxels)")
-        generated += 1
+    if voxel_count < dust_threshold:
+        if verbose:
+            print(f"  Skipping mesh: only {voxel_count} non-zero voxels (< {dust_threshold})")
+        _write_segment_properties(dest_local, [], [], [])
+        return
 
-        if verbose and generated <= 10:
-            print(f"    Segment {seg_id}: {len(vertices)} verts, {len(faces)} faces ({voxel_count} voxels)")
+    if verbose:
+        print(f"  Creating merged mesh from {voxel_count} voxels...")
 
-    # Segment properties
+    try:
+        vertices, faces, _, _ = measure.marching_cubes(mask, level=0.5, allow_degenerate=False)
+    except (ValueError, RuntimeError) as e:
+        if verbose:
+            print(f"  Failed to generate merged mesh: {e}")
+        _write_segment_properties(dest_local, [], [], [])
+        return
+
+    if len(vertices) == 0 or len(faces) == 0:
+        if verbose:
+            print("  Merged mesh has no geometry")
+        _write_segment_properties(dest_local, [], [], [])
+        return
+
+    # Transform vertices to physical coordinates (resolution + offset)
+    vertices = vertices.astype(np.float32)
+    vertices[:, 0] = vertices[:, 0] * voxel_size[0] + voxel_offset[0]
+    vertices[:, 1] = vertices[:, 1] * voxel_size[1] + voxel_offset[1]
+    vertices[:, 2] = vertices[:, 2] * voxel_size[2] + voxel_offset[2]
+    faces = faces.astype(np.uint32)
+
+    if verbose:
+        print(f"  Merged mesh: {len(vertices)} vertices, {len(faces)} faces")
+
+    # Use the lowest non-zero segment ID present in the volume for the mesh,
+    # so it is visible when intensity filtering removes low segment IDs.
+    all_segments = np.unique(arr)
+    all_segments = all_segments[all_segments > 0]
+    mesh_seg_id = int(all_segments[0])
+
+    mesh_obj = Mesh(vertices, faces, segid=mesh_seg_id)
+    vol.mesh.put(mesh_obj, compress=compress)
+
+    _write_segment_properties(
+        dest_local, [mesh_seg_id],
+        [f"Segment {mesh_seg_id}"],
+        ["Merged external boundary"],
+    )
+
+    if verbose:
+        print(f"  Wrote merged external boundary mesh (segment ID {mesh_seg_id})")
+
+
+def _write_segment_properties(dest_local, seg_ids, seg_labels, seg_descriptions):
+    """Write segment_properties/info for Neuroglancer."""
     seg_dir = os.path.join(dest_local, "segment_properties")
     os.makedirs(seg_dir, exist_ok=True)
+    ids = [str(s) for s in seg_ids]
     seg_info = {
         "@type": "neuroglancer_segment_properties",
         "inline": {
-            "ids": seg_ids,
+            "ids": ids,
             "properties": [
                 {"id": "label", "type": "label", "values": seg_labels},
+                {"id": "description", "type": "description", "values": seg_descriptions},
             ],
         },
     }
     with open(os.path.join(seg_dir, "info"), "w") as f:
         json.dump(seg_info, f, indent=2)
-
-    if verbose:
-        print(f"  Generated {generated} meshes out of {len(all_segments)} segments")
-
-    return dest_local
 
 
 def main():
@@ -229,11 +300,17 @@ def main():
     parser.add_argument("--dataset-name", default=None,
                         help="Name for the output dataset (default: derived from input)")
     parser.add_argument("--threshold", type=float, default=None,
-                        help="Intensity threshold for non-segmentation data (default: auto)")
+                        help="(unused, kept for CLI compatibility)")
     parser.add_argument("--dust-threshold", type=int, default=100,
                         help="Minimum voxel count for mesh generation (default: 100)")
     parser.add_argument("--merge-segments", action="store_true",
-                        help="Merge all non-zero voxels into a single segment")
+                        help="(unused, kept for CLI compatibility)")
+    parser.add_argument("--min-intensity", type=int, default=None,
+                        help="Minimum segment ID/intensity to keep (values below will be set to 0)")
+    parser.add_argument("--max-intensity", type=int, default=None,
+                        help="Maximum segment ID/intensity to keep (values above will be set to 0)")
+    parser.add_argument("--compress", action="store_true",
+                        help="Enable gzip compression (default: uncompressed raw chunks)")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -266,6 +343,9 @@ def main():
             threshold=args.threshold,
             dust_threshold=args.dust_threshold,
             merge_segments=args.merge_segments,
+            min_intensity=args.min_intensity,
+            max_intensity=args.max_intensity,
+            compress=args.compress,
             verbose=args.verbose,
         )
     finally:
