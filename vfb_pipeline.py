@@ -88,6 +88,15 @@ VFB_DATA_DIR = os.path.join(IMAGE_ROOT, "VFB", "i")
 # Default resolution for JRC2018Unisex template (nm)
 DEFAULT_RESOLUTION = [518.9161, 518.9161, 1000.0]
 
+# Default processing order when --template is not given.
+# Templates listed here are processed first, in order; any others come after.
+# Short_forms of the anatomical template individual (VFB_…), matching both the
+# filesystem directory name and `t.short_form` returned by the KB query.
+DEFAULT_TEMPLATE_ORDER = [
+    "VFB_00101567",  # JRC2018U / JRC2018Unisex
+    "VFB_00200000",  # JRCVNC2018U / JRC2018UnisexVNC
+]
+
 # KB (Knowledge Base) endpoint for VFBconnect
 KB_ENDPOINT = "http://kb.virtualflybrain.org"
 KB_USER = "neo4j"
@@ -135,23 +144,42 @@ def _get_neo4j_connect():
     return Neo4jConnect, dict_cursor
 
 
-def iter_kb_image_dirs(image_root: str = IMAGE_ROOT):
+def iter_kb_image_dirs(image_root: str = IMAGE_ROOT,
+                       templates: list[str] | None = None):
     """Query KB for live image folders from production datasets.
 
     Yields (image_dir, vfb_id, template_id) tuples, matching the
     interface of iter_image_dirs().
+
+    The ``in_register_with`` edge points at a *channel* individual (``VFBc_…``).
+    The anatomical template individual (``VFB_…``) is reached via
+    ``(channel)-[:depicts]->(template)``, so filtering by template short_form
+    must be applied to the template node, not the channel.
+
+    ``templates``: optional list of template short_forms (e.g. ``VFB_00101567``)
+    to restrict the query to.
     """
     Neo4jConnect, dict_cursor = _get_neo4j_connect()
     nc = Neo4jConnect(endpoint=KB_ENDPOINT, usr=KB_USER, pwd=KB_PASSWORD)
 
-    query = """
+    template_clause = ""
+    if templates:
+        # Guard against Cypher injection: only allow simple VFB-style ids.
+        safe = [t for t in templates if all(ch.isalnum() or ch == "_" for ch in t)]
+        if not safe:
+            log.warning("No valid template short_forms in filter %s", templates)
+            return
+        quoted = ", ".join("'" + t + "'" for t in safe)
+        template_clause = f"          AND t.short_form IN [{quoted}]\n"
+
+    query = f"""
         MATCH (c:Individual)-[:depicts]->(i:Individual)-[:has_source]->(ds:DataSet)
-        MATCH (c)-[r:in_register_with]->(t:Template)
+        MATCH (c)-[r:in_register_with]->(tc:Template)-[:depicts]->(t:Template)
         WHERE ds.production[0] = true
           AND r.folder IS NOT NULL
           AND (r.block IS NULL OR NOT r.block[0] = 'Missing Image')
-          AND NOT t.short_form = 'VFBc_00017894'
-        RETURN DISTINCT i.short_form AS id, r.folder[0] AS folder
+          AND NOT tc.short_form = 'VFBc_00017894'
+{template_clause}        RETURN DISTINCT i.short_form AS id, r.folder[0] AS folder, t.short_form AS template
     """
 
     log.info("Querying KB at %s for live image directories...", KB_ENDPOINT)
@@ -173,8 +201,9 @@ def iter_kb_image_dirs(image_root: str = IMAGE_ROOT):
         rel_path = rel_path.rstrip("/")
         image_dir = os.path.join(image_root, rel_path)
 
-        # Template ID is the last component of the path
-        template_id = os.path.basename(image_dir)
+        # Prefer the template individual's short_form from the KB; fall back
+        # to the last path component if the query didn't return one.
+        template_id = row.get("template") or os.path.basename(image_dir)
 
         count += 1
         yield image_dir, vfb_id, template_id
@@ -594,6 +623,13 @@ def main():
                         help="Root of VFB image data (default: /IMAGE_WRITE)")
     parser.add_argument("--use-kb", action="store_true",
                         help="Query kb.virtualflybrain.org for live images instead of scanning the filesystem")
+    parser.add_argument("--template", nargs="+", metavar="TEMPLATE_ID",
+                        help="Only process image directories aligned to the given template(s), "
+                             "given as the anatomical template individual's short_form "
+                             "(e.g. VFB_00101567 for JRC2018Unisex). Applied to the KB template "
+                             "node (not the VFBc_ channel) and to the filesystem directory name. "
+                             "When omitted, all templates are processed in the order defined "
+                             "by DEFAULT_TEMPLATE_ORDER (JRC2018U, then JRCVNC2018U), then the rest.")
     parser.add_argument("--resolution", type=float, nargs=3,
                         default=DEFAULT_RESOLUTION,
                         help="Voxel resolution in nm [x y z]")
@@ -649,13 +685,26 @@ def main():
                     targets.append((d, vfb_id, template_id))
     elif args.use_kb:
         log.info("Using KB to discover live image directories...")
-        targets = list(iter_kb_image_dirs(args.image_root))
+        targets = list(iter_kb_image_dirs(args.image_root, templates=args.template))
         log.info("Found %d live image directories from KB", len(targets))
     else:
         # Scan all
         log.info("Scanning %s for image directories...", vfb_data_dir)
         targets = list(iter_image_dirs(vfb_data_dir))
         log.info("Found %d image directories", len(targets))
+
+    # Filter / order by template
+    if args.template:
+        wanted = set(args.template)
+        before = len(targets)
+        targets = [t for t in targets if t[2] in wanted]
+        log.info("Template filter %s: %d / %d directories match",
+                 sorted(wanted), len(targets), before)
+        order = {tid: i for i, tid in enumerate(args.template)}
+        targets.sort(key=lambda t: order.get(t[2], len(order)))
+    else:
+        priority = {tid: i for i, tid in enumerate(DEFAULT_TEMPLATE_ORDER)}
+        targets.sort(key=lambda t: (priority.get(t[2], len(priority)), t[2]))
 
     if not targets:
         log.info("No image directories to process")
