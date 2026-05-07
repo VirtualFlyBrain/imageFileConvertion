@@ -745,10 +745,9 @@ def main():
         targets = list(iter_image_dirs(vfb_data_dir))
         log.info("Found %d image directories", len(targets))
 
-    # Filter / order by template.
-    # Within each template group, process the template image itself first
-    # (where vfb_id == template_id), then the rest aligned to that template.
-    # is_template_self == 0 sorts before 1.
+    # Filter / order by template. Template images (vfb_id == template_id) are
+    # fetched directly from the KB and prepended so they always run first,
+    # regardless of how (or whether) the main query returned them.
     if args.template:
         wanted = set(args.template)
         before = len(targets)
@@ -756,27 +755,30 @@ def main():
         log.info("Template filter %s: %d / %d directories match",
                  sorted(wanted), len(targets), before)
 
-        # Ensure each template's own image is included even if the main KB
-        # query didn't return it (templates often lack a has_source edge to a
-        # production DataSet). Fetch the folder URL directly from the KB.
-        if args.use_kb:
-            present = {(t[1], t[2]) for t in targets}
-            missing = [tid for tid in args.template if (tid, tid) not in present]
-            if missing:
-                try:
-                    extras = get_kb_template_image_dirs(missing, args.image_root)
-                except Exception as e:
-                    log.warning("Could not fetch template image folders from KB: %s", e)
-                    extras = []
-                for image_dir, tid, _ in extras:
-                    log.info("Adding template image %s from KB: %s", tid, image_dir)
-                    targets.append((image_dir, tid, tid))
-
         order = {tid: i for i, tid in enumerate(args.template)}
-        targets.sort(key=lambda t: (order.get(t[2], len(order)),
-                                    0 if t[1] == t[2] else 1,
-                                    t[1]))
+
+        template_targets: list[tuple] = []
+        if args.use_kb:
+            try:
+                template_targets = get_kb_template_image_dirs(args.template, args.image_root)
+            except Exception as e:
+                log.warning("Could not fetch template image folders from KB: %s", e)
+
+        # Drop any main-query entries that point at the same folder as a
+        # template image, so we don't process the template directory twice.
+        template_dirs = {tt[0] for tt in template_targets}
+        if template_dirs:
+            targets = [t for t in targets if t[0] not in template_dirs]
+
+        template_targets.sort(key=lambda t: order.get(t[2], len(order)))
+        targets.sort(key=lambda t: (order.get(t[2], len(order)), t[1]))
+
+        for tt in template_targets:
+            log.info("Template image first: %s (%s)", tt[0], tt[1])
+        targets = template_targets + targets
     else:
+        # Default: order by template priority; within a group, template image
+        # first (vfb_id == template_id), then the rest by vfb_id.
         priority = {tid: i for i, tid in enumerate(DEFAULT_TEMPLATE_ORDER)}
         targets.sort(key=lambda t: (priority.get(t[2], len(priority)),
                                     t[2],
