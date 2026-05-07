@@ -211,6 +211,56 @@ def iter_kb_image_dirs(image_root: str = IMAGE_ROOT,
     log.info("KB returned %d live image directories", count)
 
 
+def get_kb_template_image_dirs(templates: list[str],
+                               image_root: str = IMAGE_ROOT) -> list[tuple]:
+    """Fetch each template's own image folder from the KB.
+
+    Returns a list of (image_dir, vfb_id, template_id) tuples where
+    vfb_id == template_id. Unlike iter_kb_image_dirs(), this does NOT filter
+    on production datasets — templates frequently lack a has_source edge to a
+    DataSet, so the main query would otherwise omit them.
+
+    Folder URLs live on the template channel's self in_register_with edge
+    (tc)-[rt:in_register_with]->(tc), not on the c→tc edge that
+    iter_kb_image_dirs follows. URL→path mapping uses the same
+    KB_FOLDER_URL_PREFIX so the rest of the pipeline is unchanged.
+    """
+    if not templates:
+        return []
+
+    # Guard against Cypher injection: only allow simple VFB-style ids.
+    safe = [t for t in templates if all(ch.isalnum() or ch == "_" for ch in t)]
+    if not safe:
+        return []
+
+    Neo4jConnect, dict_cursor = _get_neo4j_connect()
+    nc = Neo4jConnect(endpoint=KB_ENDPOINT, usr=KB_USER, pwd=KB_PASSWORD)
+
+    quoted = ", ".join("'" + t + "'" for t in safe)
+    query = f"""
+        MATCH (tc:Template)-[:depicts]->(t:Template)
+        MATCH (tc)-[rt:in_register_with]->(tc)
+        WHERE t.short_form IN [{quoted}]
+          AND rt.folder IS NOT NULL
+        RETURN DISTINCT t.short_form AS template, rt.folder[0] AS folder
+    """
+
+    log.info("Querying KB for template image folders: %s", safe)
+    rows = dict_cursor(nc.commit_list([query]))
+
+    out = []
+    for row in rows:
+        folder_url = row["folder"]
+        tid = row["template"]
+        if not folder_url.startswith(KB_FOLDER_URL_PREFIX):
+            log.debug("  Skipping unexpected folder URL: %s", folder_url)
+            continue
+        rel_path = folder_url[len(KB_FOLDER_URL_PREFIX):].rstrip("/")
+        image_dir = os.path.join(image_root, rel_path)
+        out.append((image_dir, tid, tid))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Discovery: find image directories and classify them
 # ---------------------------------------------------------------------------
@@ -629,7 +679,9 @@ def main():
                              "(e.g. VFB_00101567 for JRC2018Unisex). Applied to the KB template "
                              "node (not the VFBc_ channel) and to the filesystem directory name. "
                              "When omitted, all templates are processed in the order defined "
-                             "by DEFAULT_TEMPLATE_ORDER (JRC2018U, then JRCVNC2018U), then the rest.")
+                             "by DEFAULT_TEMPLATE_ORDER (JRC2018U, then JRCVNC2018U), then the rest. "
+                             "Within each template group, the template image itself "
+                             "(vfb_id == template_id) is processed first.")
     parser.add_argument("--resolution", type=float, nargs=3,
                         default=DEFAULT_RESOLUTION,
                         help="Voxel resolution in nm [x y z]")
@@ -693,18 +745,43 @@ def main():
         targets = list(iter_image_dirs(vfb_data_dir))
         log.info("Found %d image directories", len(targets))
 
-    # Filter / order by template
+    # Filter / order by template.
+    # Within each template group, process the template image itself first
+    # (where vfb_id == template_id), then the rest aligned to that template.
+    # is_template_self == 0 sorts before 1.
     if args.template:
         wanted = set(args.template)
         before = len(targets)
         targets = [t for t in targets if t[2] in wanted]
         log.info("Template filter %s: %d / %d directories match",
                  sorted(wanted), len(targets), before)
+
+        # Ensure each template's own image is included even if the main KB
+        # query didn't return it (templates often lack a has_source edge to a
+        # production DataSet). Fetch the folder URL directly from the KB.
+        if args.use_kb:
+            present = {(t[1], t[2]) for t in targets}
+            missing = [tid for tid in args.template if (tid, tid) not in present]
+            if missing:
+                try:
+                    extras = get_kb_template_image_dirs(missing, args.image_root)
+                except Exception as e:
+                    log.warning("Could not fetch template image folders from KB: %s", e)
+                    extras = []
+                for image_dir, tid, _ in extras:
+                    log.info("Adding template image %s from KB: %s", tid, image_dir)
+                    targets.append((image_dir, tid, tid))
+
         order = {tid: i for i, tid in enumerate(args.template)}
-        targets.sort(key=lambda t: order.get(t[2], len(order)))
+        targets.sort(key=lambda t: (order.get(t[2], len(order)),
+                                    0 if t[1] == t[2] else 1,
+                                    t[1]))
     else:
         priority = {tid: i for i, tid in enumerate(DEFAULT_TEMPLATE_ORDER)}
-        targets.sort(key=lambda t: (priority.get(t[2], len(priority)), t[2]))
+        targets.sort(key=lambda t: (priority.get(t[2], len(priority)),
+                                    t[2],
+                                    0 if t[1] == t[2] else 1,
+                                    t[1]))
 
     if not targets:
         log.info("No image directories to process")
