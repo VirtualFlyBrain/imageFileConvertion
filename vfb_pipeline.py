@@ -595,12 +595,19 @@ def process_image(image_dir: str, vfb_id: str, template_id: str,
              status["has_swc"], status["has_nrrd"], obj_status,
              status["has_neuroglancer"])
 
+    # Template images are volume data (the brain/VNC itself). Always go via
+    # the NRRD path so neuroglancer/ contains the 0/ volume chunks, not just
+    # a mesh from volume_man.obj.
+    is_template_image = vfb_id == template_id
+
     if dry_run:
         if needs_obj:
             log.info("  Would generate: volume_man.obj from volume.swc")
-        if needs_precomputed and (has_usable_obj or needs_obj):
+        if needs_precomputed and is_template_image and status["has_nrrd"]:
+            log.info("  Would generate: neuroglancer/ (including 0/ chunks) from volume.nrrd (template image)")
+        elif needs_precomputed and (has_usable_obj or needs_obj):
             log.info("  Would generate: neuroglancer/ from volume_man.obj")
-        if needs_precomputed and status["has_nrrd"] and not has_usable_obj and not needs_obj:
+        elif needs_precomputed and status["has_nrrd"]:
             log.info("  Would generate: neuroglancer/ (including 0/ chunks) from volume.nrrd")
         return result
 
@@ -615,8 +622,13 @@ def process_image(image_dir: str, vfb_id: str, template_id: str,
             log.error("  ERROR generating OBJ: %s", e)
             return result
 
-    # Step 2a: Generate precomputed from OBJ if available
-    if needs_precomputed and has_usable_obj:
+    # For template images, prefer the NRRD path so volume chunks are produced.
+    use_nrrd_path = needs_precomputed and status["has_nrrd"] and (
+        is_template_image or not has_usable_obj
+    )
+
+    # Step 2a: Generate precomputed from OBJ (mesh-only)
+    if needs_precomputed and has_usable_obj and not use_nrrd_path:
         try:
             obj_path = os.path.join(image_dir, "volume_man.obj")
             ng_dir = os.path.join(image_dir, "neuroglancer")
@@ -626,8 +638,8 @@ def process_image(image_dir: str, vfb_id: str, template_id: str,
             result["error"] = f"Precomputed generation failed: {e}"
             log.error("  ERROR generating precomputed: %s", e)
 
-    # Step 2b: Generate precomputed (with 0/ volume chunks) from NRRD when no OBJ is available
-    elif needs_precomputed and status["has_nrrd"]:
+    # Step 2b: Generate precomputed (with 0/ volume chunks) from NRRD
+    elif use_nrrd_path:
         if _convert_nrrd is None:
             result["error"] = "convert_nrrd module not available"
             log.error("  ERROR: convert_nrrd module could not be imported")
