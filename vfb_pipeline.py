@@ -220,9 +220,10 @@ def get_kb_template_image_dirs(templates: list[str],
     on production datasets — templates frequently lack a has_source edge to a
     DataSet, so the main query would otherwise omit them.
 
-    Folder URLs come from the in_register_with edge (where the template's own
-    channel is registered against itself), which is the same source iter_kb_
-    image_dirs uses, so the URL→path mapping is identical.
+    Folder URLs live on the template channel's self in_register_with edge
+    (tc)-[rt:in_register_with]->(tc), not on the c→tc edge that
+    iter_kb_image_dirs follows. URL→path mapping uses the same
+    KB_FOLDER_URL_PREFIX so the rest of the pipeline is unchanged.
     """
     if not templates:
         return []
@@ -237,11 +238,11 @@ def get_kb_template_image_dirs(templates: list[str],
 
     quoted = ", ".join("'" + t + "'" for t in safe)
     query = f"""
-        MATCH (c:Individual)-[:depicts]->(t:Template)
-        MATCH (c)-[r:in_register_with]->(tc:Template)-[:depicts]->(t)
+        MATCH (tc:Template)-[:depicts]->(t:Template)
+        MATCH (tc)-[rt:in_register_with]->(tc)
         WHERE t.short_form IN [{quoted}]
-          AND r.folder IS NOT NULL
-        RETURN DISTINCT t.short_form AS template, r.folder[0] AS folder
+          AND rt.folder IS NOT NULL
+        RETURN DISTINCT t.short_form AS template, rt.folder[0] AS folder
     """
 
     log.info("Querying KB for template image folders: %s", safe)
