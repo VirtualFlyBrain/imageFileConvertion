@@ -335,6 +335,9 @@ def classify_dir(image_dir: str) -> dict:
             else False
         ),
         "has_neuroglancer": (d / "neuroglancer" / "info").is_file(),
+        # 0/ directory holds the volume chunks. Mesh-only outputs from
+        # write_precomputed() have neuroglancer/info but no neuroglancer/0/.
+        "has_volume_chunks": (d / "neuroglancer" / "0").is_dir(),
     }
 
 
@@ -572,9 +575,26 @@ def process_image(image_dir: str, vfb_id: str, template_id: str,
         "error": None,
     }
 
+    # Template images are volume data (the brain/VNC itself). Always go via
+    # the NRRD path so neuroglancer/ contains the 0/ volume chunks, not just
+    # a mesh from volume_man.obj.
+    is_template_image = vfb_id == template_id
+
     needs_obj = status["has_swc"] and (not status["has_obj_man"] or
                                         (status["has_obj_man"] and not status["has_obj_man_faces"]))
     needs_precomputed = not status["has_neuroglancer"]
+    # Template images need volume chunks, not just a mesh. If the existing
+    # neuroglancer/ output was produced by the OBJ-only path, neuroglancer/0/
+    # will be missing and we need to regenerate via the NRRD path.
+    if (is_template_image and status["has_nrrd"]
+            and status["has_neuroglancer"]
+            and not status["has_volume_chunks"]):
+        needs_precomputed = True
+        # Wipe the mesh-only output so convert_nrrd writes a clean tree.
+        ng_path = Path(image_dir) / "neuroglancer"
+        if not dry_run and ng_path.is_dir():
+            log.info("  [%s] Existing neuroglancer/ has no 0/ chunks — removing for regeneration", vfb_id)
+            shutil.rmtree(ng_path)
     has_usable_obj = status["has_obj_man"] and status["has_obj_man_faces"]
 
     if force:
@@ -590,15 +610,10 @@ def process_image(image_dir: str, vfb_id: str, template_id: str,
     obj_status = ("mesh" if status["has_obj_man_faces"]
                   else "no-faces" if status["has_obj_man"]
                   else "missing")
-    log.info("[%s] %s (swc=%s, nrrd=%s, obj_man=%s, ng=%s)",
+    log.info("[%s] %s (swc=%s, nrrd=%s, obj_man=%s, ng=%s, ng_0=%s)",
              vfb_id, image_dir,
              status["has_swc"], status["has_nrrd"], obj_status,
-             status["has_neuroglancer"])
-
-    # Template images are volume data (the brain/VNC itself). Always go via
-    # the NRRD path so neuroglancer/ contains the 0/ volume chunks, not just
-    # a mesh from volume_man.obj.
-    is_template_image = vfb_id == template_id
+             status["has_neuroglancer"], status["has_volume_chunks"])
 
     if dry_run:
         if needs_obj:
