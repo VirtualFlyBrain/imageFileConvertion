@@ -595,12 +595,19 @@ def process_image(image_dir: str, vfb_id: str, template_id: str,
              status["has_swc"], status["has_nrrd"], obj_status,
              status["has_neuroglancer"])
 
+    # Template images are volume data (the brain/VNC itself). Always go via
+    # the NRRD path so neuroglancer/ contains the 0/ volume chunks, not just
+    # a mesh from volume_man.obj.
+    is_template_image = vfb_id == template_id
+
     if dry_run:
         if needs_obj:
             log.info("  Would generate: volume_man.obj from volume.swc")
-        if needs_precomputed and (has_usable_obj or needs_obj):
+        if needs_precomputed and is_template_image and status["has_nrrd"]:
+            log.info("  Would generate: neuroglancer/ (including 0/ chunks) from volume.nrrd (template image)")
+        elif needs_precomputed and (has_usable_obj or needs_obj):
             log.info("  Would generate: neuroglancer/ from volume_man.obj")
-        if needs_precomputed and status["has_nrrd"] and not has_usable_obj and not needs_obj:
+        elif needs_precomputed and status["has_nrrd"]:
             log.info("  Would generate: neuroglancer/ (including 0/ chunks) from volume.nrrd")
         return result
 
@@ -615,8 +622,13 @@ def process_image(image_dir: str, vfb_id: str, template_id: str,
             log.error("  ERROR generating OBJ: %s", e)
             return result
 
-    # Step 2a: Generate precomputed from OBJ if available
-    if needs_precomputed and has_usable_obj:
+    # For template images, prefer the NRRD path so volume chunks are produced.
+    use_nrrd_path = needs_precomputed and status["has_nrrd"] and (
+        is_template_image or not has_usable_obj
+    )
+
+    # Step 2a: Generate precomputed from OBJ (mesh-only)
+    if needs_precomputed and has_usable_obj and not use_nrrd_path:
         try:
             obj_path = os.path.join(image_dir, "volume_man.obj")
             ng_dir = os.path.join(image_dir, "neuroglancer")
@@ -626,8 +638,8 @@ def process_image(image_dir: str, vfb_id: str, template_id: str,
             result["error"] = f"Precomputed generation failed: {e}"
             log.error("  ERROR generating precomputed: %s", e)
 
-    # Step 2b: Generate precomputed (with 0/ volume chunks) from NRRD when no OBJ is available
-    elif needs_precomputed and status["has_nrrd"]:
+    # Step 2b: Generate precomputed (with 0/ volume chunks) from NRRD
+    elif use_nrrd_path:
         if _convert_nrrd is None:
             result["error"] = "convert_nrrd module not available"
             log.error("  ERROR: convert_nrrd module could not be imported")
@@ -745,10 +757,9 @@ def main():
         targets = list(iter_image_dirs(vfb_data_dir))
         log.info("Found %d image directories", len(targets))
 
-    # Filter / order by template.
-    # Within each template group, process the template image itself first
-    # (where vfb_id == template_id), then the rest aligned to that template.
-    # is_template_self == 0 sorts before 1.
+    # Filter / order by template. Template images (vfb_id == template_id) are
+    # fetched directly from the KB and prepended so they always run first,
+    # regardless of how (or whether) the main query returned them.
     if args.template:
         wanted = set(args.template)
         before = len(targets)
@@ -756,27 +767,30 @@ def main():
         log.info("Template filter %s: %d / %d directories match",
                  sorted(wanted), len(targets), before)
 
-        # Ensure each template's own image is included even if the main KB
-        # query didn't return it (templates often lack a has_source edge to a
-        # production DataSet). Fetch the folder URL directly from the KB.
-        if args.use_kb:
-            present = {(t[1], t[2]) for t in targets}
-            missing = [tid for tid in args.template if (tid, tid) not in present]
-            if missing:
-                try:
-                    extras = get_kb_template_image_dirs(missing, args.image_root)
-                except Exception as e:
-                    log.warning("Could not fetch template image folders from KB: %s", e)
-                    extras = []
-                for image_dir, tid, _ in extras:
-                    log.info("Adding template image %s from KB: %s", tid, image_dir)
-                    targets.append((image_dir, tid, tid))
-
         order = {tid: i for i, tid in enumerate(args.template)}
-        targets.sort(key=lambda t: (order.get(t[2], len(order)),
-                                    0 if t[1] == t[2] else 1,
-                                    t[1]))
+
+        template_targets: list[tuple] = []
+        if args.use_kb:
+            try:
+                template_targets = get_kb_template_image_dirs(args.template, args.image_root)
+            except Exception as e:
+                log.warning("Could not fetch template image folders from KB: %s", e)
+
+        # Drop any main-query entries that point at the same folder as a
+        # template image, so we don't process the template directory twice.
+        template_dirs = {tt[0] for tt in template_targets}
+        if template_dirs:
+            targets = [t for t in targets if t[0] not in template_dirs]
+
+        template_targets.sort(key=lambda t: order.get(t[2], len(order)))
+        targets.sort(key=lambda t: (order.get(t[2], len(order)), t[1]))
+
+        for tt in template_targets:
+            log.info("Template image first: %s (%s)", tt[0], tt[1])
+        targets = template_targets + targets
     else:
+        # Default: order by template priority; within a group, template image
+        # first (vfb_id == template_id), then the rest by vfb_id.
         priority = {tid: i for i, tid in enumerate(DEFAULT_TEMPLATE_ORDER)}
         targets.sort(key=lambda t: (priority.get(t[2], len(priority)),
                                     t[2],
